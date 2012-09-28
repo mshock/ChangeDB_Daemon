@@ -8,6 +8,7 @@
 use strict;
 use Config::Simple;
 use Getopt::Std;
+use Time::Duration qw(from_now);
 use POSIX qw(strftime);
 use DBI;
 
@@ -426,12 +427,17 @@ sub copy_table {
 # TODO: write my own BCP library - CPAN's Sybase library is funky
 sub bcp_table {
 	my ($table, $sleep_duration) = @_;
+	
+	# stuff to do before going to sleep goes here
+	bcp_prep($table, $sleep_duration);
+	
 	# sleep until scheduled to run
 	sleep $sleep_duration;
-	open(my $bcp_log, '>>', "$table.log");
-	
+	open(my $bcp_log, '>>', "Logs/$table/$table.log")
+		or die "could not open bcp log @ Logs/$table/$table.log\n";
 	
 	# TODO: -n and -c compatibility w/ SQL versions???
+	# INV: BCP format file can be used to add extra columns
 	my $firstcol_query = "select column_name from information_schema.columns where table_name = '$table' and ordinal_position = 0";
 	my $select_query = "select cast(0 as int) as 'FileDate_', cast(0 as int) as 'FileNum_', row_number() over (order by ($firstcol_query)) as 'RowNum_', cast('A' as char(1)) as 'UpdateFlag_',* from [$db2_name].dbo.[$table] with (NOLOCK)";
 	# execute BCP export remote to local
@@ -445,9 +451,152 @@ sub bcp_table {
 		or print $bcp_log "filedate/filenum update on seed table failed\n";
 	
 	# delete bcp file
-	#unlink("$table.bcp") or print $bcp_log "could not delete BCP file: $table.bcp\n";
+	unlink("$table.bcp") or print $bcp_log "could not delete BCP file: $table.bcp\n";
 	close $bcp_log;
 }
+
+# pre-processing for table import w/ BCP
+sub bcp_prep {
+	my ($table, $sleep_duration) = @_;
+	
+	# create a directory for this table's logs and bcp file
+	mkdir($table) or
+		die "could not create table copy directory for $table\n";
+	
+	# write a file stating that this copy is scheduled to run
+	open(my $sched_log, '>', "Logs/$table/schedule.txt");
+	# make the sleep duration human readable
+	my $hr_sleep_duration = from_now($sleep_duration);
+	print $sched_log "The table $table is/was/will be scheduled to import at the next downtime.
+downtime: $downtime
+scheduled: $hr_sleep_duration
+seconds: $sleep_duration";
+	close $sched_log;
+	
+	# create the table in the seed database (ChangeDB)
+	
+	# get new DBI handles b/c this is a child
+	#@dbhs = init_handles($db1, $db2);
+	# TODO: hardcoded seed database for now
+	#create_table($table, 'ChangeDB', "Logs/$table/create.log");	
+}
+
+
+# TODO: add option to create from BCP format file
+# create a changedb table from a client table
+sub create_table {
+	my ($table, $database, $log) = @_;
+	
+	# defaults to top level of logdir
+	$log ||= 'Logs/create.log';
+	
+	# query that will be executed at the end of this routine to create the table
+	my $create_query;
+	
+	# open the log for this
+	open(my $create_log, '>', $log)
+		or die "could not open log for table create @ Logs/$table/create.log\n";
+	
+	# determine the filegroup of the new table
+	# only as reliable as the sys tables are (not always actively updated)
+	my $filegroup = ($dbhs[1]->selectrow_array("
+		select fg.name as 'FILEGROUP' 
+		from sys.filegroups fg
+		join sys.indexes ind
+		on ind.data_space_id = fg.data_space_id
+		join sys.tables tab
+		on tab.object_id = ind.object_id
+		where tab.name = '$table'"
+	))[0];
+		
+	# check result if table belongs to a filegroup
+	unless ($filegroup) {
+		print $create_log "no filegroup found for table $table\n"
+			and warn "no filegroup found for table $table\n";
+	}
+	else {
+		print $create_log "creating filegroup: $filegroup\n";
+		# check if filegroup already exists in this database
+		 my $filegroup_check = ($dbhs[0]->selectrow_array("
+			select top 1 fg.name as 'FILEGROUP' 
+			from sys.filegroups fg
+			join sys.indexes ind
+			on ind.data_space_id = fg.data_space_id
+			join sys.tables tab
+			on tab.object_id = ind.object_id
+			where fg.name = '$filegroup'"))[0];
+		# if it doesn't exist, add create filegroup to the query 
+		unless ($filegroup_check) {
+			# add the filegroup
+			$create_query .= "alter database [$database] add FILEGROUP [$filegroup]\ngo\n";
+			# add the file associated w/ the filegroup
+			$create_query .= "alter database [$database] add FILE (
+				NAME = $filegroup,
+				FILENAME = 'E:\\MSSQL\\DATA\\$filegroup.ndf',
+				MAXSIZE = UNLIMITED,
+				FILEGROWTH = 10%
+			) to FILEGROUP [$filegroup]\ngo\n";
+		}
+	}
+		
+	# append create table statement
+	$create_query .= "
+		create table $table
+			(
+				FileDate_ int not null,
+   				FileNum_ int  not null,
+   				RowNum_ int  not null,
+   				UpdateFlag_ char(1) not null,\n";
+		
+	# get table schema from db2
+ 	my $schema = $dbhs[1]->selectall_arrayref("
+ 		select column_name, is_nullable, data_type, character_maximum_length
+ 		from information_schema.columns
+ 		where table_name = '$table'"
+ 	);
+	 	
+	# get these columns into a table create format
+	for my $col (@{$schema}) {
+		unless (scalar @{$col}) {
+			print $create_log "empty table column schema row found\n";
+			next;
+		}
+		# unpack row
+		my ($cname, $cnull, $ctype, $clength) = @{$col};
+					
+		# if the type has a length, add it parenthetically
+		if ($clength) {
+			$ctype .= "($clength)";
+		}
+		
+		# if nullable, convert to string
+		if ($cnull =~ /no/i) {
+			$cnull = 'not null';
+		}
+		else {
+			$cnull = 'null'
+		}
+		
+		$create_query .= "$cname $ctype $cnull,\n";
+	}
+	
+	$create_query .= "Constraint pkey_$table primary key Clustered (FileDate_, FileNum_, RowNum_, UpdateFlag_) on $filegroup
+	)
+	on $filegroup\ngo\n";
+	
+	# TODO: create indexes
+	
+	print $create_log "created query:\n$create_query\n";
+
+	# execute query
+	$dbhs[0]->do($create_query) 
+		or print $create_log "create query for table $table seems to have failed\n", $dbhs[0]->errstr;
+		
+	close $create_log;
+	
+}
+
+
 
 # update the filedate and filenum for a completed seed
 # returns truth on success
