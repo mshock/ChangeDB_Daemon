@@ -2,6 +2,7 @@
 
 # compare the column schema for all matching tables between two databases
 # TODO: auto-fix table/schema mismatch
+# TODO: write + use BCPlib to handle BCP operations
 
 use strict;
 use Config::Simple;
@@ -94,14 +95,16 @@ vprint("ok\n");
 my ($db1_crdate,@db_lastupd_q) = 
 	$cli_opts{d} || $conf_opts->{check_recent} =~ $regex_true ? init_tableupd() : (undef, undef);
 
-
-
 # config test CLI option stops exec here
 config_test() if $cli_opts{t};
 
 vprint("running comparison between $db1_name & $db2_name...\n");
 # write config header to ignore configs if generating ignore file
 write_ignore('header','tables') if $gen_ignore;
+
+copy_table('idxrfctr');
+exit;
+
 # compare table schema from db1 against db2
 for my $table (sort keys %{$db_tables[1]}) {
 	# don't care about changes tables
@@ -114,11 +117,12 @@ for my $table (sort keys %{$db_tables[1]}) {
 	next if $next_flag;
 	
 	if (!$db_tables[0]->{$table}) {
-		my $err_msg = "$table not found on $db1_name";
+		my $err_msg = "$table not found on $db1_name, scheduling copy";
 		write_log('[TABLE EXISTANCE]',$err_msg,$table);
 		#printf $log_handle $log_format, '[TABLE EXISTANCE]', $err_msg;
 		vprint("\t\t$err_msg\n");
-		next;	
+		copy_table($table);
+		next;
 	}
 }
 
@@ -136,6 +140,7 @@ for my $table (sort keys %{$db_tables[0]}) {
 	next if $next_flag;
 	
 	vprint("\tverifying schema for $table...\n");
+	# only check existence of tables from db1 to db2 if explicitly asked, usually don't care
 	if ($table_backcheck && !$db_tables[1]->{$table}) {
 		my $err_msg = "$table not found on $db2_name";
 		printf $log_handle $log_format, '[TABLE EXISTANCE]', $err_msg;
@@ -398,7 +403,7 @@ sub cmp_tableupd {
 	return 0;
 }
 
-# schedule a transfer of new table seed
+# schedule a transfer of new table seed from db2 to db1
 sub copy_table {
 	my ($table) = @_;
 	# only import (huge) Date::Manip if needed at runtime
@@ -410,7 +415,7 @@ sub copy_table {
 	my $sleep_duration = $epoch_downtime - time;
 	
 	# fork a sleeping child (phrasing)
-	fork or bcp_table($table, $sleep_duration);
+	fork or bcp_table($table, $sleep_duration) and exit;
 	return 1;
 }
 
@@ -423,8 +428,10 @@ sub bcp_table {
 	sleep $sleep_duration;
 	open(my $bcp_log, '>>', "$table.log");
 	
+	
+	# TODO: -n and -c compatibility w/ SQL versions???
 	my $firstcol_query = "select column_name from information_schema.columns where table_name = '$table' and ordinal_position = 0";
-	my $select_query = "select 0 as 'FileDate_', 0 as 'FileNum_', row_number() over (order by ($firstcol_query)) as 'RowNum_', 'A' as 'UpdateFlag_' from [$db2_name].dbo.[$table] with (NOLOCK)";
+	my $select_query = "select cast(0 as int) as 'FileDate_', cast(0 as int) as 'FileNum_', row_number() over (order by ($firstcol_query)) as 'RowNum_', cast('A' as char(1)) as 'UpdateFlag_',* from [$db2_name].dbo.[$table] with (NOLOCK)";
 	# execute BCP export remote to local
 	print $bcp_log `bcp "$select_query" queryout $table.bcp -S$db2->{server} -U$db2->{user} -P$db2->{pwd} -c -e$table.export_errors`;
 		
@@ -432,11 +439,24 @@ sub bcp_table {
 	print $bcp_log `bcp [$db1_name].dbo.[$table] in $table.bcp -S$db1->{server} -U$db1->{user} -P$db1->{pwd} -c -e$table.import_errors`;
 	
 	# TODO: verify table copy somehow here + assign seed UPD filedate/filenum
+	update_seed($table)
+		or print $bcp_log "filedate/filenum update on seed table failed\n";
 	
 	# delete bcp file
-	unlink("$table.bcp") or print $bcp_log "could not delete BCP file: $table.bcp\n";
+	#unlink("$table.bcp") or print $bcp_log "could not delete BCP file: $table.bcp\n";
 	close $bcp_log;
-	exit;
+}
+
+# update the filedate and filenum for a completed seed
+# returns truth on success
+sub update_seed {
+	my ($table) = @_;
+	
+	# determine the last UPD that was processed for the seed
+	
+	# update all key columns with filedate and filenum of that UPD
+	
+	return 1;
 }
 
 # compare 2 rows from update_log upd record
@@ -540,6 +560,12 @@ sub load_ignore {
 	}	
 	close $ignore_fh;
 	return $ignores_href;
+}
+
+# fix primary key constraints for UPD metadata
+# convert RowNum_ from int to bigint (to handle large table imports)
+sub fix_keys {
+	
 }
 
 # standard usage message
