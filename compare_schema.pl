@@ -1,6 +1,7 @@
 #!perl -w
 
 # compare the column schema for all matching tables between two databases
+# TODO: possible bug w/ importing seeds with more initial rows than int type can enumerate (convert all RowNum_ keys to bigint, default row_number() output)
 # TODO: auto-fix table/schema mismatch
 # TODO: write + use BCPlib to handle BCP operations
 
@@ -44,6 +45,7 @@ $verbose = $conf_opts->{verbose} =~ $regex_true if $conf_opts->{verbose} && !$ve
 my $table_backcheck = $cli_opts{b} || $conf_opts->{back_check} =~ $regex_true;
 
 # set downtime
+my $allow_table_copy = $conf_opts->{allow_table_copy};
 my $downtime = $conf_opts->{downtime} || '12:00pm friday';
 
 # check if this is a run to generate a default ignore.conf file
@@ -560,12 +562,6 @@ sub load_ignore {
 	}	
 	close $ignore_fh;
 	return $ignores_href;
-}
-
-# fix primary key constraints for UPD metadata
-# convert RowNum_ from int to bigint (to handle large table imports)
-sub fix_keys {
-	
 }
 
 # standard usage message
