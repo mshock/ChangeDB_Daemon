@@ -33,7 +33,7 @@ my $regex_true = qr/true|y|yes|1/i;
 
 # load the configs from file
 my $cfg = load_cfg();
-my ($db1,$db2) = ($cfg->param(-block=>"db1"),$cfg->param(-block=>"db2"));
+my ($db1,$db2,$db3) = ($cfg->param(-block=>"db1"),$cfg->param(-block=>"db2"), $cfg->param(-block=>"db3"));
 my ($db1_name, $db2_name) = ($db1->{name},$db2->{name}); 
 my @db_names = ($db1->{name},$db2->{name});
 my $conf_opts = $cfg->param(-block=>"opts");
@@ -46,8 +46,8 @@ $verbose = $conf_opts->{verbose} =~ $regex_true if $conf_opts->{verbose} && !$ve
 my $table_backcheck = $cli_opts{b} || $conf_opts->{back_check} =~ $regex_true;
 
 # set downtime
-my $allow_table_copy = $conf_opts->{allow_table_copy};
-my $downtime = $conf_opts->{downtime} || '12:00pm friday';
+my $allow_table_copy = $conf_opts->{enable_table_copy} =~ $regex_true;
+my $downtime = $conf_opts->{downtime} || '12:00pm next friday';
 
 # check if this is a run to generate a default ignore.conf file
 my $gen_ignore = $conf_opts->{generate_ignore} =~ $regex_true;
@@ -105,9 +105,6 @@ vprint("running comparison between $db1_name & $db2_name...\n");
 # write config header to ignore configs if generating ignore file
 write_ignore('header','tables') if $gen_ignore;
 
-copy_table('idxrfctr');
-exit;
-
 # compare table schema from db1 against db2
 for my $table (sort keys %{$db_tables[1]}) {
 	# don't care about changes tables
@@ -120,11 +117,14 @@ for my $table (sort keys %{$db_tables[1]}) {
 	next if $next_flag;
 	
 	if (!$db_tables[0]->{$table}) {
-		my $err_msg = "$table not found on $db1_name, scheduling copy";
+		my $err_msg = "$table not found on $db1_name";
 		write_log('[TABLE EXISTANCE]',$err_msg,$table);
 		#printf $log_handle $log_format, '[TABLE EXISTANCE]', $err_msg;
+		if ($allow_table_copy) {
+			copy_table($table);
+			$err_msg .= ', scheduling copy';
+		}
 		vprint("\t\t$err_msg\n");
-		copy_table($table);
 		next;
 	}
 }
@@ -418,7 +418,7 @@ sub copy_table {
 	my $sleep_duration = $epoch_downtime - time;
 	
 	# fork a sleeping child (phrasing)
-	fork or bcp_table($table, $sleep_duration) and exit;
+	fork or bcp_table($table, $sleep_duration);
 	return 1;
 }
 
@@ -436,22 +436,26 @@ sub bcp_table {
 	open(my $bcp_log, '>>', "Logs/$table/$table.log")
 		or die "could not open bcp log @ Logs/$table/$table.log\n";
 	
+	my $error_path = "Logs\\$table\\error";
+	my $bcp_path = "Logs\\$table\\$table.bcp";
+	
+	
 	# TODO: -n and -c compatibility w/ SQL versions???
 	# INV: BCP format file can be used to add extra columns
 	my $firstcol_query = "select column_name from information_schema.columns where table_name = '$table' and ordinal_position = 0";
 	my $select_query = "select cast(0 as int) as 'FileDate_', cast(0 as int) as 'FileNum_', row_number() over (order by ($firstcol_query)) as 'RowNum_', cast('A' as char(1)) as 'UpdateFlag_',* from [$db2_name].dbo.[$table] with (NOLOCK)";
 	# execute BCP export remote to local
-	print $bcp_log `bcp "$select_query" queryout $table.bcp -S$db2->{server} -U$db2->{user} -P$db2->{pwd} -c -e$table.export_errors`;
+	print $bcp_log `bcp "$select_query" queryout $bcp_path -S$db2->{server} -U$db2->{user} -P$db2->{pwd} -c -e$error_path.export_errors`;
 		
 	# execute BCP import local
-	print $bcp_log `bcp [$db1_name].dbo.[$table] in $table.bcp -S$db1->{server} -U$db1->{user} -P$db1->{pwd} -c -e$table.import_errors`;
+	print $bcp_log `bcp [$db3->{name}].dbo.[$table] in $bcp_path -S$db3->{server} -U$db3->{user} -P$db3->{pwd} -c -e$error_path.import_errors`;
 	
 	# TODO: verify table copy somehow here + assign seed UPD filedate/filenum
 	update_seed($table)
 		or print $bcp_log "filedate/filenum update on seed table failed\n";
 	
 	# delete bcp file
-	unlink("$table.bcp") or print $bcp_log "could not delete BCP file: $table.bcp\n";
+	#unlink("$table.bcp") or print $bcp_log "could not delete BCP file: $table.bcp\n";
 	close $bcp_log;
 }
 
@@ -460,8 +464,8 @@ sub bcp_prep {
 	my ($table, $sleep_duration) = @_;
 	
 	# create a directory for this table's logs and bcp file
-	mkdir($table) or
-		die "could not create table copy directory for $table\n";
+	mkdir("Logs/$table");
+	#	die "could not create table copy directory for $table\n";
 	
 	# write a file stating that this copy is scheduled to run
 	open(my $sched_log, '>', "Logs/$table/schedule.txt");
@@ -476,9 +480,17 @@ seconds: $sleep_duration";
 	# create the table in the seed database (ChangeDB)
 	
 	# get new DBI handles b/c this is a child
-	#@dbhs = init_handles($db1, $db2);
+	@dbhs = init_handles($db3, $db2, $db1);
+	
+	# create table in the change database
+	create_table($table, $db1_name, "Logs/$table/create_current.log")
+		or die "could not create update table\n";
+	
 	# TODO: hardcoded seed database for now
-	#create_table($table, 'ChangeDB', "Logs/$table/create.log");	
+	# create table in the seed database
+	create_table($table, $db3->{name}, "Logs/$table/create_seed.log")
+	 	or die "could not create seed table\n";
+	
 }
 
 
@@ -491,7 +503,7 @@ sub create_table {
 	$log ||= 'Logs/create.log';
 	
 	# query that will be executed at the end of this routine to create the table
-	my $create_query;
+	my @queries;
 	
 	# open the log for this
 	open(my $create_log, '>', $log)
@@ -515,7 +527,7 @@ sub create_table {
 			and warn "no filegroup found for table $table\n";
 	}
 	else {
-		print $create_log "creating filegroup: $filegroup\n";
+		print $create_log "filegroup found: $filegroup\n";
 		# check if filegroup already exists in this database
 		 my $filegroup_check = ($dbhs[0]->selectrow_array("
 			select top 1 fg.name as 'FILEGROUP' 
@@ -527,20 +539,23 @@ sub create_table {
 			where fg.name = '$filegroup'"))[0];
 		# if it doesn't exist, add create filegroup to the query 
 		unless ($filegroup_check) {
+			my $create_query;
 			# add the filegroup
-			$create_query .= "alter database [$database] add FILEGROUP [$filegroup]\ngo\n";
+			$create_query = "alter database [$database] add FILEGROUP [$filegroup]\n";
+			push @queries, $create_query;
 			# add the file associated w/ the filegroup
-			$create_query .= "alter database [$database] add FILE (
+			$create_query = "alter database [$database] add FILE (
 				NAME = $filegroup,
-				FILENAME = 'E:\\MSSQL\\DATA\\$filegroup.ndf',
+				FILENAME = 'D:\\MSSQL\\DATA\\$filegroup.ndf',
 				MAXSIZE = UNLIMITED,
 				FILEGROWTH = 10%
-			) to FILEGROUP [$filegroup]\ngo\n";
+			) to FILEGROUP [$filegroup]\n";
+			push @queries, $create_query;
 		}
 	}
 		
 	# append create table statement
-	$create_query .= "
+	my $create_query = "
 		create table $table
 			(
 				FileDate_ int not null,
@@ -582,18 +597,19 @@ sub create_table {
 	
 	$create_query .= "Constraint pkey_$table primary key Clustered (FileDate_, FileNum_, RowNum_, UpdateFlag_) on $filegroup
 	)
-	on $filegroup\ngo\n";
+	on $filegroup\n";
+	
+	push @queries, $create_query;
 	
 	# TODO: create indexes
 	
-	print $create_log "created query:\n$create_query\n";
+	print $create_log "created queries:\n", join("\n", @queries);
 
-	# execute query
-	$dbhs[0]->do($create_query) 
-		or print $create_log "create query for table $table seems to have failed\n", $dbhs[0]->errstr;
-		
+	# execute all generated queries
+	# sleep 5 seconds between each to allow filegroups to get created
+	map {$dbhs[0]->do($_) and sleep 5} @queries; 
+	#	or print $create_log "create query for table $table seems to have failed\n", $dbhs[0]->errstr;
 	close $create_log;
-	
 }
 
 
@@ -604,6 +620,8 @@ sub update_seed {
 	my ($table) = @_;
 	
 	# determine the last UPD that was processed for the seed
+	# get highest row number, find it in the change database
+	
 	
 	# update all key columns with filedate and filenum of that UPD
 	
