@@ -439,8 +439,6 @@ sub bcp_table {
 	my $error_path = "Logs\\$table\\error";
 	my $bcp_path = "Logs\\$table\\$table.bcp";
 	
-	
-	# TODO: -n and -c compatibility w/ SQL versions???
 	# INV: BCP format file can be used to add extra columns
 	my $firstcol_query = "select column_name from information_schema.columns where table_name = '$table' and ordinal_position = 0";
 	my $select_query = "select cast(0 as int) as 'FileDate_', cast(0 as int) as 'FileNum_', row_number() over (order by ($firstcol_query)) as 'RowNum_', cast('A' as char(1)) as 'UpdateFlag_',* from [$db2_name].dbo.[$table] with (NOLOCK)";
@@ -483,12 +481,11 @@ seconds: $sleep_duration";
 	@dbhs = init_handles($db3, $db2, $db1);
 	
 	# create table in the change database
-	create_table($table, $db1_name, "Logs/$table/create_current.log")
+	create_table($table, $dbhs[2], $db1_name, "Logs/$table/create_current.log")
 		or die "could not create update table\n";
 	
-	# TODO: hardcoded seed database for now
 	# create table in the seed database
-	create_table($table, $db3->{name}, "Logs/$table/create_seed.log")
+	create_table($table, $dbhs[0], $db3->{name}, "Logs/$table/create_seed.log")
 	 	or die "could not create seed table\n";
 	
 }
@@ -497,7 +494,7 @@ seconds: $sleep_duration";
 # TODO: add option to create from BCP format file
 # create a changedb table from a client table
 sub create_table {
-	my ($table, $database, $log) = @_;
+	my ($table, $dbh, $database, $log) = @_;
 	
 	# defaults to top level of logdir
 	$log ||= 'Logs/create.log';
@@ -527,9 +524,15 @@ sub create_table {
 			and warn "no filegroup found for table $table\n";
 	}
 	else {
-		print $create_log "filegroup found: $filegroup\n";
+		# different filegroup for current database
+		my $fg_name = $filegroup;
+		if ($database =~ /_current/i) {
+			$fg_name .= '_current';
+		}
+		print $create_log "remote filegroup found: $filegroup\n";
+		
 		# check if filegroup already exists in this database
-		 my $filegroup_check = ($dbhs[0]->selectrow_array("
+		 my $filegroup_check = ($dbh->selectrow_array("
 			select top 1 fg.name as 'FILEGROUP' 
 			from sys.filegroups fg
 			join sys.indexes ind
@@ -539,6 +542,7 @@ sub create_table {
 			where fg.name = '$filegroup'"))[0];
 		# if it doesn't exist, add create filegroup to the query 
 		unless ($filegroup_check) {
+			print $create_log "local filegroup not found, creating\n";
 			my $create_query;
 			# add the filegroup
 			$create_query = "alter database [$database] add FILEGROUP [$filegroup]\n";
@@ -546,17 +550,20 @@ sub create_table {
 			# add the file associated w/ the filegroup
 			$create_query = "alter database [$database] add FILE (
 				NAME = $filegroup,
-				FILENAME = 'D:\\MSSQL\\DATA\\$filegroup.ndf',
+				FILENAME = 'D:\\MSSQL\\DATA\\$fg_name.ndf',
 				MAXSIZE = UNLIMITED,
 				FILEGROWTH = 10%
 			) to FILEGROUP [$filegroup]\n";
 			push @queries, $create_query;
 		}
+		else {		
+			print $create_log "local filegroup found: $filegroup_check\n";
+		}
 	}
 		
 	# append create table statement
 	my $create_query = "
-		create table $table
+		create table [$database].dbo.[$table]
 			(
 				FileDate_ int not null,
    				FileNum_ int  not null,
@@ -607,24 +614,23 @@ sub create_table {
 
 	# execute all generated queries
 	# sleep 5 seconds between each to allow filegroups to get created
-	map {$dbhs[0]->do($_) and sleep 5} @queries; 
+	map {$dbh->do($_)} @queries; 
 	#	or print $create_log "create query for table $table seems to have failed\n", $dbhs[0]->errstr;
 	close $create_log;
 }
 
 
 
-# update the filedate and filenum for a completed seed
-# returns truth on success
+# update the seed 
 sub update_seed {
 	my ($table) = @_;
+
+	# determine the last UPD
 	
-	# determine the last UPD that was processed for the seed
-	# get highest row number, find it in the change database
+	# call SmartLoader to apply on seed
 	
-	
-	# update all key columns with filedate and filenum of that UPD
-	
+	# update all UPD metadata for seed 
+
 	return 1;
 }
 
